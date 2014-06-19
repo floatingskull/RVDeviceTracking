@@ -1,0 +1,255 @@
+/*
+University of Washington
+Classroom Technology & Events
+David Cornwell
+*/
+
+#help_begin
+
+RoomView Device Tracking Core
+
+This module is designed to track which source, from a list of ten, is
+being routed to a display.  Whenever a source is un-routed or the display 
+is turned off, the module produces a serial string to be sent to RoomView's 
+device tracking.
+
+The proper setup for this module is to include an interlock-toggle before
+it in SIMPL, for each of the device_to_disp joins.  This interlock
+should be cleared by a NOR of the same values that feed it.
+
+If you would like to track sources sent to multiple displays (i.e. in a room
+with two projectors), two copies of this module will need to be added to your
+SIMPL program.
+
+I/O Definitions:
+
+disp_on - this should be driven high when the display power is turned on.
+
+device_to_disp[1 to 10] - these should be driven high while the
+corresponding input is actually being routed to the display.  They should
+go low when the route is broken.
+
+to_roomview$ - connect this string output to the RoomView or Fusion serial
+joins for Device Usage, included with the corresponding symbol.
+
+Parameter Definitions:
+
+device_type[1 to 10] - These should be populated with string values for
+the device types you wish to send to RoomView.  These correspond to the 
+device_to_disp joins and the device_name strings of matching numbers.
+
+device_name[1 to 10] - These should be populated with string values for the
+names for devices 1 through 10.  This information will be sent to RoomView.
+
+#help_end
+
+//Compiler Directives
+
+#Default_Volatile
+#Enable_Trace
+#Print_to_Trace
+#CATEGORY "46" "UW/CTE Custom Modules"
+
+//Set this constant to 1 to print to debugger.
+#Define_Constant debug 0
+#Define_Constant numDevices 10
+
+//IO Variables
+
+digital_input disp_on, device_to_disp[numDevices,numDevices];
+
+string_output to_roomview$;
+            
+
+//Parameters
+
+string_parameter _skip_, device_type[numDevices][20], device_name[numDevices,numDevices][20];
+
+//Parameter Properties
+
+#begin_parameter_properties device_type
+propvalidunits = unitstring;
+#end_parameter_properties
+
+#begin_parameter_properties device_name
+propvalidunits = unitstring;
+#end_parameter_properties
+
+//Global Variables
+
+integer gl_which_device_to_disp, gl_aretracking, gl_startstamp, gl_endstamp, gl_stdst;
+
+string gl_duration$[5];
+
+//Functions
+
+function determine_disp_device()
+{
+	//This function determines which input is being routed to the display.
+	//It will only return the lowest-numbered input, so put an interlock in front of this module.
+	
+ 	integer i;
+ 	 	
+ 	i = 1;
+ 	gl_which_device_to_disp = 0;
+ 	
+ 	while(gl_which_device_to_disp < 1 && i <= numDevices)
+ 	{	
+ 		if(device_to_disp[i])
+ 		{
+ 			gl_which_device_to_disp = i;
+ 			if(debug) print("Device to Display = %i", i); 
+ 		}
+ 		
+ 		i = i + 1;
+ 	}
+}
+
+string_function get_time()
+{
+	//This function returns the time in proper format; 12 hour, AM/PM.
+	string date$[11], ampm$[2], time$[2][3];
+	integer hours, i;
+	
+	hours = gethournum();
+	
+	//Convert the hours value from 24 hour to 12 hour, set AM/PM.
+	if(hours > 12)
+	{
+		hours = hours - 12;
+		ampm$ = "PM";
+	}
+	else if(hours = 0)
+	{
+		hours = 12;
+		ampm$ = "AM";
+	}
+	else ampm$ = "AM";
+	
+	//Convert integers to ascii.
+    time$[2] = itoa(hours);
+	time$[1] = itoa(getminutesnum());
+	time$[0] = itoa(getsecondsnum());
+	
+	//Add leading zeroes.
+	for(i = 0 to 1)	if(len(time$[i]) = 1) makestring(time$[i], "0%s", time$[i]); 
+	
+	//Actually build the string.	
+	makestring(date$, "%s:%s:%s %s", time$[2], time$[1], time$[0], ampm$);
+	
+	return(date$);
+}
+
+function stop_tracking()
+{
+	//This function stops tracking the use of a device.
+	//It then creates a string to send to RoomView to collect the data.
+    
+    integer i;
+    signed_integer dur;
+	
+	gl_endstamp = getminutesnum() + (gethournum() * 60);
+	
+	if(debug) print("End Time is %i", gl_endstamp);
+ 	
+ 	//Find out how long we tracked.
+ 	dur = gl_endstamp - gl_startstamp;
+ 	
+ 	//Compare start and stop DST values, and compensate if necessary.
+ 	if(gl_stdst != getdst())
+ 	{
+ 		if(gl_stdst > getdst()) dur = dur - 60;
+ 		else if(gl_stdst < getdst()) dur = dur + 60;
+ 	}
+ 	
+ 	//Populate a string with duration minutes. 	
+ 	gl_duration$ = itoa(dur);
+ 	if(dur < 0) if(debug) print("Negative duration.  Someone's been messing with the system clock.");
+ 	else if(debug) print("Duration is %s minutes", gl_duration$);
+ 	
+ 	//Time to update the string to send to RoomView, assuming we tracked more than 0 minutes.
+ 	if(dur > 0) makestring(to_roomview$, "USAGE||%s||%s||TIME||%s||%s||-||%s||-||\r", date(1), get_time(), device_type[gl_which_device_to_disp], device_name[gl_which_device_to_disp], gl_duration$);
+	
+	//Define that we are no longer tracking use.
+	gl_aretracking = 0;
+}
+
+function start_tracking()
+{
+	//This function starts tracking device usage.
+	long_integer wait_timer;
+	
+	gl_startstamp = getminutesnum() + (gethournum() * 60); 
+	gl_stdst = getdst();
+	   	
+   	//Define that we are now tracking use.
+   	gl_aretracking = 1;
+                
+    if(debug) print("Start Time = %i|%i", gl_startstamp, gl_stdst);
+    
+    //Start a wait timer.  This will stop the tracking system 5 seconds before midnight.
+    //It will then restart five seconds after midnight, after sending an update to RoomView.
+    wait_timer = ((((1439 - gl_startstamp) * 60) + (60 - getsecondsnum())) * 100) - 500;
+    
+    if(debug) print("The Glorious Wait Timer: %li", wait_timer);
+    
+    wait(wait_timer, stop_timer)
+    {
+    	stop_tracking();
+    	wait(1000) start_tracking();
+    	processlogic();
+    }
+    
+    //Return priority to SIMPL processing, just in case.
+    processlogic();		
+}
+
+
+//Events
+
+push device_to_disp
+{
+	//When a device is routed to a display, check what device is routed,
+	//then start tracking it if the display is on and we're not tracking.
+	determine_disp_device();
+	if(disp_on && gl_aretracking = 0) start_tracking();
+}
+
+release device_to_disp
+{
+	//When a device is un-routed, we need to stop tracking, assuming we actually were tracking.
+	//We also need to cancel the scheduled midnight restart of the tracker.
+	if(gl_aretracking = 1)
+	{
+		cancelwait(stop_timer);
+		stop_tracking();
+	}
+}
+
+push disp_on
+{
+	//When the display is turned on, check what device is routed,
+	//then start tracking it if a device is actually routed and we're not tracking.
+	determine_disp_device();
+	if(device_to_disp[gl_which_device_to_disp] && gl_aretracking = 0) start_tracking();
+}
+
+release disp_on
+{
+	//When the display is turned off, we need to stop tracking, assuming we were tracking.
+	//We also need to cancel the scheduled midnight restart of the tracker.
+ 	if(gl_aretracking = 1)
+ 	{
+ 		cancelwait(stop_timer);
+ 		stop_tracking();
+ 	}
+}
+
+//Main (Startup Code)
+
+Function Main()
+{
+	//We need to wait for the processor to completely boot before we do anything.
+    waitforinitializationcomplete();
+    
+}
